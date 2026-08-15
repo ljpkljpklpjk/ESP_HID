@@ -1,6 +1,12 @@
 #include "CommandServer.h"
 #include "AbsoluteMouse.h"
 #include "USBHIDKeyboard.h"
+#include "USB.h"
+#include "USBHID.h"
+
+// 日志同时输出到 HWCDC(Serial) 与板载 UART0(Serial0/CH340)，
+// 便于未连接 USB Serial/JTAG 口时通过 CH340 (COM13) 查看日志
+#define LOG(...) do { Serial.printf(__VA_ARGS__); Serial0.printf(__VA_ARGS__); } while (0)
 
 // 外部全局HID对象（在main.cpp中定义）
 extern AbsoluteMouse  AbsMouse;
@@ -51,7 +57,7 @@ uint8_t CommandServer::keyNameToCode(const char* name) {
         {"enter",    0xB0}, {"return",   0xB0},
         {"esc",      0xB1}, {"escape",   0xB1},
         {"backspace",0xB2}, {"tab",      0xB3},
-        {"space",    0x2C}, {" ",        0x2C},
+        {"space",    0x20}, {" ",        0x20},
         {"up",       0xDA}, {"down",     0xD9},
         {"left",     0xD8}, {"right",    0xD7},
         {"insert",   0xD1}, {"delete",   0xD4},
@@ -184,23 +190,52 @@ static void executeCommand(const ParsedCommand& cmd) {
         break;
     }
     case CMD_TYPE: {
-        Keyboard.write((const uint8_t*)cmd.text, strlen(cmd.text));
-        Serial.printf("  TYPE \"%s\"\n", cmd.text);
+        // 逐字符 press/release 并加延时：USB HID 键盘报告单缓冲，
+        // 连续快速发送会使部分报告因端点忙碌而丢失（tud_hid_n_report
+        // 返回 false 但框架不检查返回值），导致键卡住污染后续命令。
+        const char* p = cmd.text;
+        int n = 0;
+        while (*p) {
+            if (*p == '\\' && *(p + 1) == 'n') {
+                // 字面 "\n" 转义为 Enter（0x0A -> _asciimap -> HID 0x28）
+                Keyboard.press(0x0A);
+                delay(20);
+                Keyboard.release(0x0A);
+                delay(20);
+                p += 2;
+                n++;
+            } else {
+                Keyboard.press((uint8_t)*p);   // 按下（自动处理 ASCII/Shift）
+                delay(20);                      // 等按下报告发送完成
+                Keyboard.release((uint8_t)*p);  // 释放
+                delay(20);                      // 等释放报告发送完成
+                p++;
+                n++;
+            }
+        }
+        Keyboard.releaseAll();              // 兜底：清空所有残留键
+        delay(20);
+        LOG("  TYPE \"%s\" (%d chars)\n", cmd.text, n);
         break;
     }
     case CMD_KEY: {
         if (cmd.key) {
             Keyboard.write(cmd.key);
-            Serial.printf("  KEY code=%02X\n", cmd.key);
+            LOG("  KEY code=%02X\n", cmd.key);
         }
         break;
     }
     case CMD_KEY_COMBO: {
         if (cmd.modifier && cmd.key) {
+            Keyboard.releaseAll();
+            delay(20);
             Keyboard.press(cmd.modifier);
+            delay(20);
             Keyboard.write(cmd.key);
+            delay(20);
             Keyboard.release(cmd.modifier);
-            Serial.printf("  KEY_COMBO mod=%02X key=%02X\n", cmd.modifier, cmd.key);
+            delay(20);
+            LOG("  KEY_COMBO mod=%02X key=%02X\n", cmd.modifier, cmd.key);
         }
         break;
     }
@@ -278,14 +313,13 @@ void CommandServer::loop() {
                 if (_bufPos > 0 && (c == '\n' || _client.peek() != '\n')) {
                     _jsonBuf[_bufPos] = '\0';
 
-                    Serial.print("Received: ");
-                    Serial.println(_jsonBuf);
+                    LOG("Received: %s\n", _jsonBuf);
 
                     ParsedCommand cmd;
                     if (parseCommand(_jsonBuf, cmd)) {
                         executeCommand(cmd);
                     } else {
-                        Serial.println("  -> Unknown command");
+                        LOG("  -> Unknown command\n");
                     }
 
                     _bufPos = 0;
